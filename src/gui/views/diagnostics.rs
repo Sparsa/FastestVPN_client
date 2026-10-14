@@ -1,6 +1,6 @@
 use crate::backend::elevation::which;
 use crate::backend::service::{ServiceCommand, VpnBackendService};
-use crate::backend::tunnel::{TunnelController, DEFAULT_INTERFACE_NAME};
+use crate::backend::tunnel::TunnelController;
 use crate::gui::theme::{
     card_frame, COLOR_ACCENT, COLOR_CONNECTED, COLOR_ERROR, COLOR_TEXT, COLOR_TEXT_MUTED,
 };
@@ -23,9 +23,9 @@ impl DiagnosticsView {
     pub fn render(&mut self, ui: &mut egui::Ui, service: &VpnBackendService) {
         let pkexec_path = which("pkexec");
         let wg_quick_path = which("wg-quick");
-        let wg_path = which("wg");
+        let openvpn_path = which("openvpn");
         let controller = TunnelController::default();
-        let is_interface_up = controller.is_interface_active();
+        let active_tunnel = controller.active_interface();
         let policy_path = Path::new("/usr/share/polkit-1/actions/com.fastestvpn.wgquick.policy");
         let policy_installed = policy_path.exists();
 
@@ -33,9 +33,9 @@ impl DiagnosticsView {
 
         card_frame().show(ui, |ui| {
             ui.vertical(|ui| {
-                ui.label(RichText::new("🛠 System & WireGuard Diagnostics").strong().size(15.0).color(COLOR_TEXT));
+                ui.label(RichText::new("🛠 System & VPN Diagnostics").strong().size(15.0).color(COLOR_TEXT));
                 ui.label(
-                    RichText::new("Checks Linux system components required for safe root elevation and WireGuard networking.")
+                    RichText::new("Checks Linux system components required for safe root elevation, WireGuard, and OpenVPN networking.")
                         .size(12.0)
                         .color(COLOR_TEXT_MUTED),
                 );
@@ -64,23 +64,23 @@ impl DiagnosticsView {
                         }),
                 );
 
-                // Check wg
+                // Check OpenVPN
                 Self::render_check_row(
                     ui,
-                    "WireGuard CLI (wg)",
-                    wg_path.is_some(),
-                    wg_path
+                    "OpenVPN CLI",
+                    openvpn_path.is_some(),
+                    openvpn_path
                         .map(|p| p.to_string_lossy().to_string())
-                        .unwrap_or_else(|| "Not installed (part of wireguard-tools).".to_string()),
+                        .unwrap_or_else(|| "Not installed! Run 'sudo pacman -S openvpn'.".to_string()),
                 );
 
-                // Check Tunnel Interface
+                // Check Active Interface
                 Self::render_check_row(
                     ui,
-                    &format!("Interface ({DEFAULT_INTERFACE_NAME})"),
+                    "Active VPN Interface",
                     true,
-                    if is_interface_up {
-                        "Interface active in Linux kernel sysfs (/sys/class/net)".to_string()
+                    if let Some((iface, proto)) = active_tunnel {
+                        format!("Active: {iface} ({proto})")
                     } else {
                         "Down / Inactive".to_string()
                     },

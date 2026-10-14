@@ -1,5 +1,6 @@
-use crate::backend::config::VpnProfile;
+use crate::backend::config::{VpnProfile, VpnProtocol};
 use crate::backend::service::{ServiceCommand, VpnBackendService};
+use crate::backend::storage::AppSettings;
 use crate::backend::tunnel::{NetworkStats, TunnelState};
 use crate::gui::theme::{
     card_frame, format_bytes, format_duration, format_rate, COLOR_ACCENT, COLOR_CONNECTED,
@@ -14,6 +15,7 @@ impl DashboardView {
     pub fn render(
         ui: &mut egui::Ui,
         service: &VpnBackendService,
+        settings: &mut AppSettings,
         profiles: &[VpnProfile],
         selected_profile_id: &mut String,
     ) {
@@ -25,16 +27,18 @@ impl DashboardView {
         // Header status bar
         Self::render_status_banner(ui, &current_state);
 
-        ui.add_space(18.0);
+        ui.add_space(16.0);
 
         // Main Connect / Disconnect Action Card
         card_frame().show(ui, |ui| {
             ui.vertical_centered(|ui| {
-                ui.add_space(10.0);
+                ui.add_space(8.0);
 
-                // Profile Selector Dropdown
+                let is_busy = matches!(current_state, TunnelState::Connected { .. } | TunnelState::Connecting { .. });
+
+                // Server and Protocol Row
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("VPN Server:").strong().color(COLOR_TEXT_MUTED));
+                    ui.label(RichText::new("Server:").strong().color(COLOR_TEXT_MUTED));
 
                     let current_name = profiles
                         .iter()
@@ -42,12 +46,10 @@ impl DashboardView {
                         .map(|p| format!("{} ({})", p.name, p.country_code))
                         .unwrap_or_else(|| "Select a Server Profile".to_string());
 
-                    let is_connected = matches!(current_state, TunnelState::Connected { .. } | TunnelState::Connecting { .. });
-
-                    ui.add_enabled_ui(!is_connected, |ui| {
+                    ui.add_enabled_ui(!is_busy, |ui| {
                         egui::ComboBox::from_id_salt("profile_selector")
                             .selected_text(RichText::new(current_name).color(COLOR_TEXT).strong())
-                            .width(320.0)
+                            .width(280.0)
                             .show_ui(ui, |ui| {
                                 for profile in profiles {
                                     let label = format!("[{}] {} - {}", profile.country_code, profile.name, profile.display_endpoint());
@@ -59,9 +61,24 @@ impl DashboardView {
                                 }
                             });
                     });
+
+                    ui.add_space(10.0);
+
+                    // Protocol Selector Dropdown
+                    ui.label(RichText::new("Protocol:").strong().color(COLOR_TEXT_MUTED));
+                    ui.add_enabled_ui(!is_busy, |ui| {
+                        egui::ComboBox::from_id_salt("protocol_selector")
+                            .selected_text(RichText::new(format!("{}", settings.preferred_protocol)).strong().color(COLOR_ACCENT))
+                            .width(150.0)
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut settings.preferred_protocol, VpnProtocol::WireGuard, "⚡ WireGuard");
+                                ui.selectable_value(&mut settings.preferred_protocol, VpnProtocol::OpenVpnUdp, "🛡 OpenVPN (UDP)");
+                                ui.selectable_value(&mut settings.preferred_protocol, VpnProtocol::OpenVpnTcp, "🔒 OpenVPN (TCP)");
+                            });
+                    });
                 });
 
-                ui.add_space(20.0);
+                ui.add_space(18.0);
 
                 // Big Connect / Disconnect Toggle Button
                 let is_connected = matches!(current_state, TunnelState::Connected { .. });
@@ -92,19 +109,32 @@ impl DashboardView {
                     if is_connected {
                         service.send_command(ServiceCommand::Disconnect);
                     } else if let Some(selected) = profiles.iter().find(|p| &p.id == selected_profile_id) {
-                        service.send_command(ServiceCommand::Connect(selected.clone()));
+                        let mut target_profile = selected.clone();
+                        // The protocol picker applies to built-in presets only; imported
+                        // .conf/.ovpn profiles can only be run with their own protocol.
+                        if target_profile.is_preset {
+                            target_profile.protocol = settings.preferred_protocol;
+                        }
+
+                        service.send_command(ServiceCommand::Connect {
+                            profile: target_profile,
+                            username: settings.username.clone(),
+                            password: settings.password.clone(),
+                        });
                     }
                 }
 
                 ui.add_space(12.0);
 
+                // Status Message Subtitle
                 match &current_state {
-                    TunnelState::Connected { endpoint, interface, connected_at, .. } => {
+                    TunnelState::Connected { endpoint, protocol, interface, connected_at, .. } => {
                         let duration = Instant::now().duration_since(*connected_at).as_secs();
                         ui.label(
                             RichText::new(format!(
-                                "Interface: {} • Endpoint: {} • Uptime: {}",
+                                "Interface: {} • Protocol: {} • Endpoint: {} • Uptime: {}",
                                 interface,
+                                protocol,
                                 endpoint,
                                 format_duration(duration)
                             ))
@@ -113,15 +143,23 @@ impl DashboardView {
                         );
                     }
                     TunnelState::Disconnected => {
-                        ui.label(
-                            RichText::new("Your internet traffic is unencrypted. Connect to FastestVPN to secure it.")
-                                .color(COLOR_TEXT_MUTED)
-                                .size(12.5),
-                        );
+                        if settings.preferred_protocol != VpnProtocol::WireGuard && settings.username.trim().is_empty() {
+                            ui.label(
+                                RichText::new("⚠️ OpenVPN requires your FastestVPN Username & Password. Sign in on the Servers tab.")
+                                    .color(COLOR_CONNECTING)
+                                    .size(12.5),
+                            );
+                        } else {
+                            ui.label(
+                                RichText::new("Your internet traffic is unencrypted. Connect to FastestVPN to secure it.")
+                                    .color(COLOR_TEXT_MUTED)
+                                    .size(12.5),
+                            );
+                        }
                     }
-                    TunnelState::Connecting { server_name, .. } => {
+                    TunnelState::Connecting { server_name, protocol, .. } => {
                         ui.label(
-                            RichText::new(format!("Elevating privileges via pkexec and securing tunnel to {}...", server_name))
+                            RichText::new(format!("Elevating via pkexec and securing {protocol} tunnel to {server_name}..."))
                                 .color(COLOR_CONNECTING)
                                 .size(12.5),
                         );
@@ -136,7 +174,7 @@ impl DashboardView {
                     _ => {}
                 }
 
-                ui.add_space(10.0);
+                ui.add_space(8.0);
             });
         });
 
@@ -149,16 +187,20 @@ impl DashboardView {
     fn render_status_banner(ui: &mut egui::Ui, state: &TunnelState) {
         card_frame().show(ui, |ui| {
             ui.horizontal(|ui| {
-                let (dot_color, status_text) = match state {
-                    TunnelState::Connected { profile_name, .. } => {
-                        (COLOR_CONNECTED, format!("PROTECTED — CONNECTED TO {}", profile_name.to_uppercase()))
-                    }
-                    TunnelState::Connecting { server_name, .. } => {
-                        (COLOR_CONNECTING, format!("ESTABLISHING SECURE TUNNEL TO {}...", server_name.to_uppercase()))
-                    }
-                    TunnelState::Disconnecting => (COLOR_CONNECTING, "DISCONNECTING TUNNEL...".to_string()),
-                    TunnelState::Disconnected => (Color32::from_rgb(156, 163, 175), "UNPROTECTED — DISCONNECTED".to_string()),
-                    TunnelState::Error { .. } => (COLOR_ERROR, "CONNECTION ERROR".to_string()),
+                let (dot_color, status_text, proto_label) = match state {
+                    TunnelState::Connected { profile_name, protocol, .. } => (
+                        COLOR_CONNECTED,
+                        format!("PROTECTED — CONNECTED TO {}", profile_name.to_uppercase()),
+                        format!("{protocol}"),
+                    ),
+                    TunnelState::Connecting { server_name, protocol, .. } => (
+                        COLOR_CONNECTING,
+                        format!("ESTABLISHING SECURE TUNNEL TO {}...", server_name.to_uppercase()),
+                        format!("{protocol}"),
+                    ),
+                    TunnelState::Disconnecting => (COLOR_CONNECTING, "DISCONNECTING TUNNEL...".to_string(), "VPN".to_string()),
+                    TunnelState::Disconnected => (Color32::from_rgb(156, 163, 175), "UNPROTECTED — DISCONNECTED".to_string(), "Disabled".to_string()),
+                    TunnelState::Error { .. } => (COLOR_ERROR, "CONNECTION ERROR".to_string(), "Error".to_string()),
                 };
 
                 let (rect, _response) = ui.allocate_exact_size(Vec2::new(14.0, 14.0), Sense::hover());
@@ -168,7 +210,7 @@ impl DashboardView {
                 ui.label(RichText::new(status_text).strong().size(14.0).color(COLOR_TEXT));
 
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.label(RichText::new("WireGuard Protocol").color(COLOR_TEXT_MUTED).size(12.0));
+                    ui.label(RichText::new(proto_label).color(COLOR_ACCENT).size(12.5).strong());
                 });
             });
         });

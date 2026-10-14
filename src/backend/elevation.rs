@@ -10,6 +10,8 @@ pub enum ElevationError {
     PkexecNotFound,
     #[error("wg-quick binary not found. Install wireguard-tools (e.g. 'sudo pacman -S wireguard-tools').")]
     WgQuickNotFound,
+    #[error("openvpn binary not found. Install openvpn (e.g. 'sudo pacman -S openvpn').")]
+    OpenVpnNotFound,
     #[error("Elevation was cancelled or dismissed by the user.")]
     AuthenticationCancelled,
     #[error("Authentication failed: invalid credentials or permission denied.")]
@@ -131,6 +133,91 @@ impl ElevationManager {
         self.run_pkexec(&["wg", "show", interface_name])
     }
 
+    /// Check if `openvpn` is installed on the system.
+    pub fn is_openvpn_available(&self) -> bool {
+        which("openvpn").is_some() || Path::new("/usr/bin/openvpn").exists()
+    }
+
+    /// Execute `openvpn` daemon safely via `pkexec`.
+    pub fn openvpn_up(
+        &self,
+        config_path: &Path,
+        auth_file_path: &Path,
+        pid_file_path: &Path,
+        interface_name: &str,
+    ) -> Result<String, ElevationError> {
+        if !self.is_pkexec_available() {
+            return Err(ElevationError::PkexecNotFound);
+        }
+        if !self.is_openvpn_available() {
+            return Err(ElevationError::OpenVpnNotFound);
+        }
+
+        validate_interface_name(interface_name)?;
+        let safe_cfg = validate_safe_path(config_path)?;
+        let safe_auth = validate_safe_path(auth_file_path)?;
+
+        // The pid file does not exist yet, so canonicalize its parent directory instead.
+        let pid_parent = pid_file_path
+            .parent()
+            .ok_or_else(|| ElevationError::UnsafePath(format!("{:?}", pid_file_path)))?;
+        let pid_name = pid_file_path
+            .file_name()
+            .ok_or_else(|| ElevationError::UnsafePath(format!("{:?}", pid_file_path)))?;
+        let safe_pid = validate_safe_path(pid_parent)?.join(pid_name);
+
+        let cfg_str = safe_cfg.to_str().ok_or_else(|| ElevationError::UnsafePath("Non-UTF8 config".to_string()))?;
+        let auth_str = safe_auth.to_str().ok_or_else(|| ElevationError::UnsafePath("Non-UTF8 auth".to_string()))?;
+        let pid_str = safe_pid.to_str().ok_or_else(|| ElevationError::UnsafePath("Non-UTF8 pid file".to_string()))?;
+
+        self.run_pkexec(&[
+            "openvpn",
+            "--config",
+            cfg_str,
+            "--auth-user-pass",
+            auth_str,
+            "--dev",
+            interface_name,
+            "--dev-type",
+            "tun",
+            "--nobind",
+            "--verb",
+            "3",
+            "--writepid",
+            pid_str,
+            "--daemon",
+            interface_name,
+        ])
+    }
+
+    /// Terminate the OpenVPN daemon via a single `pkexec` call.
+    ///
+    /// Prefers the pid recorded by `--writepid`; falls back to matching the daemon
+    /// name passed via `--daemon <interface_name>` when no pid file is available.
+    pub fn openvpn_down(
+        &self,
+        interface_name: &str,
+        pid_file_path: &Path,
+    ) -> Result<String, ElevationError> {
+        if !self.is_pkexec_available() {
+            return Err(ElevationError::PkexecNotFound);
+        }
+        validate_interface_name(interface_name)?;
+
+        let pid = fs::read_to_string(pid_file_path)
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .filter(|&pid| pid > 1);
+
+        match pid {
+            Some(pid) => self.run_pkexec(&["kill", "-TERM", &pid.to_string()]),
+            None => {
+                let pattern = format!("openvpn .*--daemon {interface_name}$");
+                self.run_pkexec(&["pkill", "-TERM", "-f", &pattern])
+            }
+        }
+    }
+
     fn ensure_binaries(&self) -> Result<(), ElevationError> {
         if !self.is_pkexec_available() {
             return Err(ElevationError::PkexecNotFound);
@@ -224,6 +311,17 @@ impl ElevationManager {
       <allow_active>yes</allow_active>
     </defaults>
     <annotate key="org.freedesktop.policykit.exec.path">/usr/bin/wg-quick</annotate>
+    <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
+  </action>
+  <action id="com.fastestvpn.openvpn">
+    <description>Manage FastestVPN OpenVPN Tunnels</description>
+    <message>Authentication is required to start or stop FastestVPN OpenVPN tunnels</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>yes</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/bin/openvpn</annotate>
     <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
   </action>
 </policyconfig>

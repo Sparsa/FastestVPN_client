@@ -1,5 +1,5 @@
-use crate::backend::config::VpnProfile;
-use crate::backend::service::VpnBackendService;
+use crate::backend::config::{VpnProfile, VpnProtocol};
+use crate::backend::service::{ServiceEvent, VpnBackendService};
 use crate::backend::storage::{AppSettings, ProfileStore};
 use crate::backend::tunnel::TunnelState;
 use crate::gui::theme::{
@@ -25,6 +25,8 @@ pub struct FastestVpnApp {
     settings: AppSettings,
     profiles: Vec<VpnProfile>,
     selected_profile_id: String,
+    /// Protocol the loaded presets were built with; tracks dashboard picker changes.
+    applied_protocol: VpnProtocol,
 
     // Views
     profiles_view: ProfilesView,
@@ -40,6 +42,7 @@ impl FastestVpnApp {
         let store = ProfileStore::new();
         let settings = store.load_settings();
         let profiles = store.load_all_profiles(&settings);
+        let applied_protocol = settings.preferred_protocol;
 
         let selected_profile_id = settings
             .default_profile_id
@@ -54,6 +57,7 @@ impl FastestVpnApp {
             settings,
             profiles,
             selected_profile_id,
+            applied_protocol,
             profiles_view: ProfilesView::default(),
             diagnostics_view: DiagnosticsView::default(),
             logs_view: LogsView::default(),
@@ -64,9 +68,58 @@ impl FastestVpnApp {
 impl eframe::App for FastestVpnApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         // Poll events from the backend service worker
-        self.service.poll_events(|_event| {
-            // Events already update shared thread-safe state in the service
+        let mut settings_dirty = false;
+        let mut profiles_dirty = false;
+        let profiles_view = &mut self.profiles_view;
+        let settings = &mut self.settings;
+        self.service.poll_events(|event| match event {
+            ServiceEvent::LoginResult(Ok((user, token))) => {
+                if token.is_some() {
+                    settings.auth_token = token;
+                }
+                if let Some(status) = user.status {
+                    settings.account_status = Some(status);
+                }
+                if let Some(expiry) = user.expiry_date {
+                    settings.expiry_date = Some(expiry);
+                }
+                if let Some(plan) = user.plan_name {
+                    settings.plan_name = Some(plan);
+                }
+                // Provisioned WireGuard credentials activate the built-in presets.
+                if let Some(key) = user.wireguard_private_key.filter(|k| !k.trim().is_empty()) {
+                    settings.user_private_key = key.trim().to_string();
+                    profiles_dirty = true;
+                }
+                if let Some(ip) = user.wireguard_ip.filter(|ip| !ip.trim().is_empty()) {
+                    settings.user_assigned_ip = ip.trim().to_string();
+                    profiles_dirty = true;
+                }
+                if settings.account_status.is_none() {
+                    settings.account_status = Some("Active".to_string());
+                }
+                profiles_view.set_login_feedback(Ok("Login verified.".to_string()));
+                settings_dirty = true;
+            }
+            ServiceEvent::LoginResult(Err(err)) => {
+                profiles_view.set_login_feedback(Err(err));
+            }
+            _ => {}
         });
+
+        // Presets take their protocol from the dashboard picker; persist and re-apply it.
+        if self.settings.preferred_protocol != self.applied_protocol {
+            self.applied_protocol = self.settings.preferred_protocol;
+            settings_dirty = true;
+            profiles_dirty = true;
+        }
+
+        if settings_dirty {
+            let _ = self.store.save_settings(&self.settings);
+        }
+        if profiles_dirty {
+            self.profiles = self.store.load_all_profiles(&self.settings);
+        }
 
         // Request repaint periodically for smooth real-time metric counter updates
         ui.ctx().request_repaint_after(Duration::from_millis(500));
@@ -108,7 +161,7 @@ impl eframe::App for FastestVpnApp {
                         }
                     }
 
-                    // Right side status pill
+                    // Right side status & user pill
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         let current_state = self.service.current_state.lock().unwrap().clone();
                         let (dot_color, label) = match current_state {
@@ -122,6 +175,14 @@ impl eframe::App for FastestVpnApp {
                         let (rect, _) = ui.allocate_exact_size(Vec2::new(10.0, 10.0), egui::Sense::hover());
                         ui.painter().circle_filled(rect.center(), 4.5, dot_color);
                         ui.label(RichText::new(label).size(12.0).color(COLOR_TEXT_MUTED));
+
+                        if !self.settings.username.is_empty() {
+                            ui.label(
+                                RichText::new(format!("👤 {}", self.settings.username))
+                                    .size(12.0)
+                                    .color(COLOR_ACCENT),
+                            );
+                        }
                     });
                 });
             });
@@ -138,6 +199,7 @@ impl eframe::App for FastestVpnApp {
                     DashboardView::render(
                         ui,
                         &self.service,
+                        &mut self.settings,
                         &self.profiles,
                         &mut self.selected_profile_id,
                     );

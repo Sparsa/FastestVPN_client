@@ -1,6 +1,6 @@
 use fastestvpn_gui::backend::elevation::which;
 use fastestvpn_gui::backend::storage::ProfileStore;
-use fastestvpn_gui::backend::tunnel::{TunnelController, DEFAULT_INTERFACE_NAME};
+use fastestvpn_gui::backend::tunnel::{TunnelController, TunnelError, DEFAULT_WG_INTERFACE};
 use fastestvpn_gui::gui::FastestVpnApp;
 use std::env;
 
@@ -11,12 +11,12 @@ fn main() -> eframe::Result<()> {
     if args.len() > 1 {
         match args[1].as_str() {
             "--help" | "-h" => {
-                println!("FastestVPN Linux Desktop & CLI Client");
+                println!("FastestVPN Linux Desktop & CLI Client (WireGuard & OpenVPN)");
                 println!();
                 println!("Usage:");
                 println!("  fastestvpn-gui              Launch GUI desktop application");
                 println!("  fastestvpn-gui --list       List available FastestVPN server profiles");
-                println!("  fastestvpn-gui --status     Show active WireGuard tunnel status");
+                println!("  fastestvpn-gui --status     Show active WireGuard / OpenVPN tunnel status");
                 println!("  fastestvpn-gui --down       Disconnect active tunnel via pkexec");
                 println!("  fastestvpn-gui --doctor     Run system & dependency diagnostics");
                 return Ok(());
@@ -27,15 +27,15 @@ fn main() -> eframe::Result<()> {
                 let profiles = store.load_all_profiles(&settings);
                 println!("Available FastestVPN Profiles ({}):", profiles.len());
                 for p in profiles {
-                    println!("  • [{}] {:<24} -> {}", p.country_code, p.name, p.display_endpoint());
+                    println!("  • [{:<2}] [{:<9}] {:<24} -> {}", p.country_code, format!("{}", p.protocol), p.name, p.display_endpoint());
                 }
                 return Ok(());
             }
             "--status" | "-s" => {
                 let controller = TunnelController::default();
-                if controller.is_interface_active() {
-                    println!("Tunnel '{}' is ACTIVE.", controller.interface_name());
-                    if let Some(stats) = controller.read_statistics() {
+                if let Some((iface, proto)) = controller.active_interface() {
+                    println!("Tunnel '{iface}' ({proto}) is ACTIVE.");
+                    if let Some(stats) = controller.read_statistics(&iface) {
                         println!("  Transferred: RX {} bytes, TX {} bytes", stats.rx_bytes, stats.tx_bytes);
                     }
                 } else {
@@ -44,10 +44,11 @@ fn main() -> eframe::Result<()> {
                 return Ok(());
             }
             "--down" | "-d" => {
-                println!("Disconnecting WireGuard tunnel...");
+                println!("Disconnecting active VPN tunnel(s)...");
                 let controller = TunnelController::default();
-                match controller.stop_tunnel() {
-                    Ok(()) => println!("Tunnel disconnected successfully."),
+                match controller.stop_active() {
+                    Ok(()) => println!("Tunnel(s) disconnected successfully."),
+                    Err(TunnelError::NotConnected) => println!("No active tunnel found."),
                     Err(e) => eprintln!("Error disconnecting tunnel: {e}"),
                 }
                 return Ok(());
@@ -57,7 +58,8 @@ fn main() -> eframe::Result<()> {
                 println!("  pkexec:       {:?}", which("pkexec"));
                 println!("  wg-quick:     {:?}", which("wg-quick"));
                 println!("  wg:           {:?}", which("wg"));
-                println!("  Interface:    /sys/class/net/{}", DEFAULT_INTERFACE_NAME);
+                println!("  openvpn:      {:?}", which("openvpn"));
+                println!("  WG Interface: /sys/class/net/{}", DEFAULT_WG_INTERFACE);
                 let polkit_path = std::path::Path::new("/usr/share/polkit-1/actions/com.fastestvpn.wgquick.policy");
                 println!("  Polkit Rule:  {}", if polkit_path.exists() { "Installed" } else { "Not installed" });
                 return Ok(());

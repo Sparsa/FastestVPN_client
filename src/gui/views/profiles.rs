@@ -1,4 +1,4 @@
-use crate::backend::config::{InterfaceConfig, PeerConfig, VpnProfile, WireGuardConfig};
+use crate::backend::config::{InterfaceConfig, PeerConfig, VpnProfile, VpnProtocol, WireGuardConfig};
 use crate::backend::service::{ServiceCommand, VpnBackendService};
 use crate::backend::storage::{AppSettings, ProfileStore};
 use crate::backend::tunnel::TunnelState;
@@ -12,6 +12,12 @@ pub struct ProfilesView {
     search_query: String,
     show_new_dialog: bool,
     show_credentials_dialog: bool,
+
+    // Login state
+    login_username: String,
+    login_password: String,
+    show_password: bool,
+    login_msg: Option<Result<String, String>>,
 
     // New profile form state
     new_name: String,
@@ -34,6 +40,10 @@ impl Default for ProfilesView {
             search_query: String::new(),
             show_new_dialog: false,
             show_credentials_dialog: false,
+            login_username: String::new(),
+            login_password: String::new(),
+            show_password: false,
+            login_msg: None,
             new_name: String::new(),
             new_private_key: String::new(),
             new_address: "10.13.1.2/32".to_string(),
@@ -49,6 +59,11 @@ impl Default for ProfilesView {
 }
 
 impl ProfilesView {
+    /// Shows the outcome of an API login in the account dialog.
+    pub fn set_login_feedback(&mut self, result: Result<String, String>) {
+        self.login_msg = Some(result);
+    }
+
     pub fn render(
         &mut self,
         ui: &mut egui::Ui,
@@ -59,7 +74,6 @@ impl ProfilesView {
         selected_profile_id: &mut String,
     ) {
         let current_state = service.current_state.lock().unwrap().clone();
-        let _is_connected = matches!(current_state, TunnelState::Connected { .. });
 
         // Action Toolbar
         card_frame().show(ui, |ui| {
@@ -67,8 +81,8 @@ impl ProfilesView {
                 ui.label(RichText::new("🔍").size(15.0));
                 ui.add(
                     TextEdit::singleline(&mut self.search_query)
-                        .hint_text("Search country, city, or server...")
-                        .desired_width(220.0),
+                        .hint_text("Search country, city, server...")
+                        .desired_width(200.0),
                 );
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -77,9 +91,9 @@ impl ProfilesView {
                         self.new_form_error = None;
                     }
 
-                    if ui.button(RichText::new("📁 Import .conf").strong()).clicked() {
+                    if ui.button(RichText::new("📁 Import (.conf / .ovpn)").strong()).clicked() {
                         if let Some(path) = rfd::FileDialog::new()
-                            .add_filter("WireGuard Configuration", &["conf"])
+                            .add_filter("VPN Profiles", &["conf", "ovpn"])
                             .pick_file()
                         {
                             match store.import_file(&path) {
@@ -94,7 +108,15 @@ impl ProfilesView {
                         }
                     }
 
-                    if ui.button(RichText::new("🔑 Account Credentials").color(COLOR_ACCENT)).clicked() {
+                    let cred_btn_label = if !settings.username.is_empty() {
+                        format!("👤 {}", settings.username)
+                    } else {
+                        "🔑 Account & Login".to_string()
+                    };
+
+                    if ui.button(RichText::new(cred_btn_label).color(COLOR_ACCENT).strong()).clicked() {
+                        self.login_username = settings.username.clone();
+                        self.login_password = settings.password.clone();
                         self.cred_private_key = settings.user_private_key.clone();
                         self.cred_address = settings.user_assigned_ip.clone();
                         self.show_credentials_dialog = true;
@@ -106,9 +128,9 @@ impl ProfilesView {
 
         ui.add_space(10.0);
 
-        // Account Credentials Dialog
+        // Account Credentials & Login Dialog
         if self.show_credentials_dialog {
-            self.render_credentials_dialog(ui, store, settings, profiles);
+            self.render_credentials_dialog(ui, service, store, settings, profiles);
         }
 
         // New Profile Modal Dialog
@@ -183,10 +205,25 @@ impl ProfilesView {
                             ui.vertical(|ui| {
                                 ui.horizontal(|ui| {
                                     ui.label(RichText::new(&profile.name).strong().size(14.0).color(COLOR_TEXT));
+
+                                    // Protocol Badge
+                                    let (proto_label, proto_color) = match profile.protocol {
+                                        VpnProtocol::WireGuard => ("WireGuard", COLOR_ACCENT),
+                                        VpnProtocol::OpenVpnUdp => ("OpenVPN UDP", Color32::from_rgb(168, 85, 247)),
+                                        VpnProtocol::OpenVpnTcp => ("OpenVPN TCP", Color32::from_rgb(234, 179, 8)),
+                                    };
+
+                                    ui.label(
+                                        RichText::new(format!("[{proto_label}]"))
+                                            .size(11.0)
+                                            .color(proto_color)
+                                            .strong(),
+                                    );
+
                                     if profile.is_preset {
                                         ui.label(RichText::new("Preset").size(11.0).color(COLOR_TEXT_MUTED));
                                     } else {
-                                        ui.label(RichText::new("Custom").size(11.0).color(COLOR_ACCENT));
+                                        ui.label(RichText::new("Custom").size(11.0).color(COLOR_CONNECTED));
                                     }
                                 });
                                 ui.label(
@@ -209,7 +246,11 @@ impl ProfilesView {
                                         .fill(if is_selected { COLOR_ACCENT } else { Color32::from_rgb(51, 65, 85) });
                                     if ui.add(btn).clicked() {
                                         *selected_profile_id = profile.id.clone();
-                                        service.send_command(ServiceCommand::Connect(profile.clone()));
+                                        service.send_command(ServiceCommand::Connect {
+                                            profile: profile.clone(),
+                                            username: settings.username.clone(),
+                                            password: settings.password.clone(),
+                                        });
                                     }
                                 }
 
@@ -242,6 +283,7 @@ impl ProfilesView {
     fn render_credentials_dialog(
         &mut self,
         ui: &mut egui::Ui,
+        service: &VpnBackendService,
         store: &ProfileStore,
         settings: &mut AppSettings,
         profiles: &mut Vec<VpnProfile>,
@@ -249,7 +291,7 @@ impl ProfilesView {
         card_frame().show(ui, |ui| {
             ui.vertical(|ui| {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("🔑 FastestVPN Account Configuration").strong().size(15.0).color(COLOR_TEXT));
+                    ui.label(RichText::new("👤 FastestVPN Account & Credentials").strong().size(15.0).color(COLOR_TEXT));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.button("✖").clicked() {
                             self.show_credentials_dialog = false;
@@ -257,33 +299,125 @@ impl ProfilesView {
                     });
                 });
 
-                ui.label(
-                    RichText::new("FastestVPN assigns a unique WireGuard Private Key and internal IP to your account. Entering them here automatically activates all built-in server presets!")
-                        .size(12.0)
-                        .color(COLOR_TEXT_MUTED),
-                );
-
                 ui.add_space(8.0);
 
-                ui.label(RichText::new("WireGuard PrivateKey (44 chars base64):").size(12.0).color(COLOR_TEXT));
-                ui.add(TextEdit::singleline(&mut self.cred_private_key).hint_text("e.g. YWFhYWFhY...=").desired_width(450.0));
+                // Section 1: Username & Password Authentication (for OpenVPN and API verification)
+                ui.group(|ui| {
+                    ui.label(RichText::new("1. FastestVPN Login (Username & Password)").strong().size(13.0).color(COLOR_ACCENT));
+                    ui.label(
+                        RichText::new("Used for OpenVPN tunnels and for verifying your active subscription status with FastestVPN API.")
+                            .size(11.5)
+                            .color(COLOR_TEXT_MUTED),
+                    );
 
-                ui.add_space(4.0);
-                ui.label(RichText::new("Assigned Client Address / IP:").size(12.0).color(COLOR_TEXT));
-                ui.add(TextEdit::singleline(&mut self.cred_address).hint_text("e.g. 10.13.1.2/32").desired_width(250.0));
+                    ui.add_space(6.0);
+
+                    ui.horizontal(|ui| {
+                        ui.label("Account Email:");
+                        ui.add(TextEdit::singleline(&mut self.login_username).hint_text("user@example.com").desired_width(260.0));
+                    });
+
+                    ui.horizontal(|ui| {
+                        ui.label("Account Password:");
+                        ui.add(
+                            TextEdit::singleline(&mut self.login_password)
+                                .password(!self.show_password)
+                                .hint_text("password")
+                                .desired_width(220.0),
+                        );
+                        ui.checkbox(&mut self.show_password, "Show");
+                    });
+
+                    ui.add_space(6.0);
+
+                    ui.horizontal(|ui| {
+                        if ui.button(RichText::new("🔐 Verify Account with FastestVPN API").strong()).clicked() {
+                            settings.username = self.login_username.trim().to_string();
+                            settings.password = self.login_password.trim().to_string();
+                            let _ = store.save_settings(settings);
+                            self.login_msg = Some(Ok("Verifying account…".to_string()));
+
+                            service.send_command(ServiceCommand::LoginApi {
+                                username: settings.username.clone(),
+                                password: settings.password.clone(),
+                            });
+                        }
+
+                        if !settings.username.is_empty() {
+                            if ui.button(RichText::new("Log Out / Clear").color(COLOR_ERROR)).clicked() {
+                                settings.username.clear();
+                                settings.password.clear();
+                                settings.auth_token = None;
+                                settings.account_status = None;
+                                settings.expiry_date = None;
+                                settings.plan_name = None;
+                                self.login_msg = None;
+                                self.login_username.clear();
+                                self.login_password.clear();
+                                let _ = store.save_settings(settings);
+                            }
+                        }
+                    });
+
+                    match &self.login_msg {
+                        Some(Err(err)) => {
+                            ui.add_space(4.0);
+                            ui.label(RichText::new(format!("✖ {err}")).color(COLOR_ERROR).size(12.0));
+                        }
+                        Some(Ok(msg)) => {
+                            ui.add_space(4.0);
+                            ui.label(RichText::new(msg).color(COLOR_TEXT_MUTED).size(12.0));
+                        }
+                        None => {}
+                    }
+
+                    if let Some(ref status) = settings.account_status {
+                        ui.add_space(4.0);
+                        let expiry = settings.expiry_date.as_deref().unwrap_or("Active");
+                        ui.label(
+                            RichText::new(format!("✓ Account Status: {status} • Expiry: {expiry}"))
+                                .color(COLOR_CONNECTED)
+                                .size(12.0),
+                        );
+                    }
+                });
+
+                ui.add_space(10.0);
+
+                // Section 2: WireGuard Cryptographic Keypair (for WireGuard Protocol)
+                ui.group(|ui| {
+                    ui.label(RichText::new("2. WireGuard Keypair (Optional, for WireGuard Protocol)").strong().size(13.0).color(COLOR_ACCENT));
+                    ui.label(
+                        RichText::new("If using the WireGuard protocol, enter your assigned 44-character PrivateKey and Client IP.")
+                            .size(11.5)
+                            .color(COLOR_TEXT_MUTED),
+                    );
+
+                    ui.add_space(6.0);
+
+                    ui.label("WireGuard PrivateKey (44 chars Base64):");
+                    ui.add(TextEdit::singleline(&mut self.cred_private_key).hint_text("e.g. YWFhYWFhY...=").desired_width(450.0));
+
+                    ui.add_space(4.0);
+                    ui.label("Assigned Client Address / IP:");
+                    ui.add(TextEdit::singleline(&mut self.cred_address).hint_text("e.g. 10.13.1.2/32").desired_width(250.0));
+                });
 
                 if let Some(ref msg) = self.cred_msg {
+                    ui.add_space(6.0);
                     ui.label(RichText::new(msg).color(COLOR_CONNECTED).size(12.0));
                 }
 
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
-                    if ui.button(RichText::new("Apply & Update Presets").strong().color(Color32::WHITE)).clicked() {
+                    if ui.button(RichText::new("Save All Credentials").strong().color(Color32::WHITE)).clicked() {
+                        settings.username = self.login_username.trim().to_string();
+                        settings.password = self.login_password.trim().to_string();
                         settings.user_private_key = self.cred_private_key.trim().to_string();
                         settings.user_assigned_ip = self.cred_address.trim().to_string();
                         let _ = store.save_settings(settings);
                         *profiles = store.load_all_profiles(settings);
-                        self.cred_msg = Some("Credentials saved! All FastestVPN presets updated.".to_string());
+                        self.cred_msg = Some("All credentials saved successfully!".to_string());
                     }
 
                     if ui.button("Close").clicked() {

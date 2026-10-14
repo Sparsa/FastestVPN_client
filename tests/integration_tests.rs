@@ -2,7 +2,11 @@ use fastestvpn_gui::backend::config::{
     infer_location, parse_wireguard_conf, sanitize_id,
 };
 use fastestvpn_gui::backend::elevation::{validate_interface_name, ElevationManager};
-use fastestvpn_gui::backend::tunnel::DEFAULT_INTERFACE_NAME;
+use fastestvpn_gui::backend::config::{get_fastestvpn_presets, VpnProtocol};
+use fastestvpn_gui::backend::openvpn::{generate_fastestvpn_ovpn, load_ovpn_profile_from_file};
+use fastestvpn_gui::backend::tunnel::{
+    TunnelController, TunnelError, DEFAULT_OPENVPN_INTERFACE, DEFAULT_WG_INTERFACE,
+};
 
 #[test]
 fn test_wireguard_parser_valid_config() {
@@ -57,7 +61,8 @@ Endpoint = de-01.jumptoserver.com:51820
 #[test]
 fn test_elevation_safety_interface_validation() {
     // Valid interfaces (IFNAMSIZ <= 15)
-    assert!(validate_interface_name(DEFAULT_INTERFACE_NAME).is_ok());
+    assert!(validate_interface_name(DEFAULT_WG_INTERFACE).is_ok());
+    assert!(validate_interface_name(DEFAULT_OPENVPN_INTERFACE).is_ok());
     assert!(validate_interface_name("wg0").is_ok());
     assert!(validate_interface_name("fastest-vpn").is_ok());
     assert!(validate_interface_name("fvpn_de").is_ok());
@@ -102,4 +107,52 @@ fn test_polkit_policy_generation() {
     assert!(policy.contains("com.fastestvpn.wgquick"));
     assert!(policy.contains("/usr/bin/wg-quick"));
     assert!(policy.contains("Authentication is required to start or stop FastestVPN WireGuard tunnels"));
+}
+
+
+#[test]
+fn test_ovpn_generation() {
+    let tcp = generate_fastestvpn_ovpn("de-01.jumptoserver.com", VpnProtocol::OpenVpnTcp);
+    assert!(tcp.contains("remote de-01.jumptoserver.com 4443"));
+    assert!(tcp.contains("proto tcp"));
+    assert!(tcp.contains("<ca>") && tcp.contains("</tls-auth>"));
+    assert!(tcp.contains("data-ciphers-fallback AES-256-CBC"));
+
+    let udp = generate_fastestvpn_ovpn("nl-01.jumptoserver.com", VpnProtocol::OpenVpnUdp);
+    assert!(udp.contains("proto udp"));
+}
+
+#[test]
+fn test_ovpn_profile_id_stable_across_reload() {
+    let dir = std::env::temp_dir().join(format!("fvpn-test-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let original = dir.join("germany-frankfurt-tcp.ovpn");
+    std::fs::write(
+        &original,
+        generate_fastestvpn_ovpn("de-01.jumptoserver.com", VpnProtocol::OpenVpnTcp),
+    )
+    .unwrap();
+    let imported = load_ovpn_profile_from_file(&original).unwrap();
+    assert_eq!(imported.protocol, VpnProtocol::OpenVpnTcp);
+    assert_eq!(imported.display_endpoint(), "de-01.jumptoserver.com:4443");
+
+    // ProfileStore stores imports as `<id>.ovpn`; reloading must yield the same id.
+    let stored = dir.join(format!("{}.ovpn", imported.id));
+    std::fs::copy(&original, &stored).unwrap();
+    let reloaded = load_ovpn_profile_from_file(&stored).unwrap();
+    assert_eq!(reloaded.id, imported.id);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_wireguard_refuses_placeholder_credentials() {
+    // Presets without a user key must not reach pkexec / wg-quick.
+    let controller = TunnelController::default();
+    let preset = get_fastestvpn_presets("", "").remove(0);
+    match controller.start_wireguard_tunnel(&preset) {
+        Err(TunnelError::InvalidProfile(_)) => {}
+        other => panic!("expected InvalidProfile, got {other:?}"),
+    }
 }

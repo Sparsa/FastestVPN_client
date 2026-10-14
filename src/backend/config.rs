@@ -93,7 +93,7 @@ impl Default for PeerConfig {
 }
 
 /// Full WireGuard configuration profile.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct WireGuardConfig {
     pub interface: InterfaceConfig,
     pub peer: PeerConfig,
@@ -179,7 +179,25 @@ impl WireGuardConfig {
     }
 }
 
-/// Profile metadata with user-friendly country, city, and identifier.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum VpnProtocol {
+    #[default]
+    WireGuard,
+    OpenVpnUdp,
+    OpenVpnTcp,
+}
+
+impl std::fmt::Display for VpnProtocol {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            VpnProtocol::WireGuard => write!(f, "WireGuard"),
+            VpnProtocol::OpenVpnUdp => write!(f, "OpenVPN (UDP)"),
+            VpnProtocol::OpenVpnTcp => write!(f, "OpenVPN (TCP)"),
+        }
+    }
+}
+
+/// Profile metadata with user-friendly country, city, protocol and identifier.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct VpnProfile {
     pub id: String,
@@ -187,9 +205,11 @@ pub struct VpnProfile {
     pub country: String,
     pub country_code: String,
     pub city: String,
+    pub protocol: VpnProtocol,
     pub config: WireGuardConfig,
     pub file_path: Option<PathBuf>,
     pub is_preset: bool,
+    pub ovpn_endpoint: Option<String>,
 }
 
 impl VpnProfile {
@@ -202,14 +222,20 @@ impl VpnProfile {
             country,
             country_code: code,
             city,
+            protocol: VpnProtocol::WireGuard,
             config,
             file_path: None,
             is_preset: false,
+            ovpn_endpoint: None,
         }
     }
 
     pub fn display_endpoint(&self) -> &str {
-        &self.config.peer.endpoint
+        if let Some(ref ep) = self.ovpn_endpoint {
+            ep
+        } else {
+            &self.config.peer.endpoint
+        }
     }
 }
 
@@ -405,9 +431,11 @@ pub fn load_profile_from_file(path: &Path) -> Result<VpnProfile, ConfigError> {
         country,
         country_code: code,
         city,
+        protocol: VpnProtocol::WireGuard,
         config,
         file_path: Some(path.to_path_buf()),
         is_preset: false,
+        ovpn_endpoint: None,
     })
 }
 
@@ -513,6 +541,10 @@ pub fn infer_location(name_or_file: &str, endpoint: &str) -> (String, String, St
 }
 
 /// Sanitize profile ID for filename and WireGuard interface safety.
+/// Syntactically valid stand-in key used for presets until the user supplies their own.
+/// Tunnels must never be started with it.
+pub const PLACEHOLDER_PRIVATE_KEY: &str = "YWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWE=";
+
 pub fn sanitize_id(raw: &str) -> String {
     let sanitized: String = raw
         .chars()
@@ -610,7 +642,7 @@ pub fn get_fastestvpn_presets(user_private_key: &str, user_address: &str) -> Vec
     ];
 
     let priv_key = if user_private_key.trim().is_empty() {
-        "YWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWE=".to_string() // Dummy valid 44-char base64 key
+        PLACEHOLDER_PRIVATE_KEY.to_string()
     } else {
         user_private_key.trim().to_string()
     };
@@ -651,9 +683,11 @@ pub fn get_fastestvpn_presets(user_private_key: &str, user_address: &str) -> Vec
                 country: format_profile_name(name),
                 country_code: code.to_string(),
                 city: city.to_string(),
+                protocol: VpnProtocol::WireGuard,
                 config,
                 file_path: None,
                 is_preset: true,
+                ovpn_endpoint: None,
             }
         })
         .collect()
