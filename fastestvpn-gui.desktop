@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=FastestVPN Client
+Comment=Lightweight FastestVPN WireGuard Client for Linux
+Exec=fastestvpn-gui
+Icon=network-vpn
+Terminal=false
+Type=Application
+Categories=Network;Security;VPN;
+Keywords=vpn;wireguard;fastestvpn;tunnel;privacy;
+StartupNotify=true
