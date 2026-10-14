@@ -1,0 +1,102 @@
+name: AppImage
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    # Oldest supported runner: the AppImage only runs on glibc >= the build host's (2.35).
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libwayland-dev libxkbcommon-dev file desktop-file-utils
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Determine version
+        id: version
+        run: |
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            version="$(cargo metadata --no-deps --format-version 1 \
+              | jq -r '.packages[] | select(.name == "fastestvpn-gui") | .version')-${GITHUB_SHA::7}"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Package AppImage
+        env:
+          # The runner has no FUSE; let linuxdeploy run from an extracted copy.
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+          LINUXDEPLOY_OUTPUT_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          desktop-file-validate fastestvpn-gui.desktop
+
+          mkdir -p tools dist
+          wget -q -O tools/linuxdeploy https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
+          chmod +x tools/linuxdeploy
+
+          out="fastestvpn-gui-${{ steps.version.outputs.version }}-x86_64.AppImage"
+          LDAI_OUTPUT="dist/$out" tools/linuxdeploy \
+            --appdir AppDir \
+            --executable target/release/fastestvpn-gui \
+            --desktop-file fastestvpn-gui.desktop \
+            --icon-file assets/fastestvpn-gui.svg \
+            --output appimage
+
+          cd dist
+          sha256sum "$out" > "$out.sha256"
+          echo "APPIMAGE=dist/$out" >> "$GITHUB_ENV"
+
+      - name: Smoke-test AppImage
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+        run: |
+          ./"$APPIMAGE" --help
+          ./"$APPIMAGE" --doctor
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fastestvpn-gui-appimage
+          path: |
+            ${{ env.APPIMAGE }}
+            ${{ env.APPIMAGE }}.sha256
+          if-no-files-found: error
+
+  release:
+    if: github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: fastestvpn-gui-appimage
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            *.AppImage
+            *.AppImage.sha256
+          generate_release_notes: true
