@@ -5,7 +5,15 @@ on:
     branches: [main, master]
     tags: ["v*"]
   pull_request:
+  # Creating/publishing a release in the GitHub UI attaches the AppImage to it.
+  release:
+    types: [published]
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Existing release tag to attach the AppImage to (empty = build only)"
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -16,6 +24,9 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Build exactly the tagged commit when attaching to an existing release.
+          ref: ${{ inputs.release_tag || github.ref }}
 
       - name: Install build dependencies
         run: |
@@ -36,7 +47,10 @@ jobs:
       - name: Determine version
         id: version
         run: |
-          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+          if [[ -n "${{ inputs.release_tag }}" ]]; then
+            version="${{ inputs.release_tag }}"
+            version="${version#v}"
+          elif [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
             version="${GITHUB_REF_NAME#v}"
           else
             version="$(cargo metadata --no-deps --format-version 1 \
@@ -57,12 +71,28 @@ jobs:
           chmod +x tools/linuxdeploy
 
           out="fastestvpn-gui-${{ steps.version.outputs.version }}-x86_64.AppImage"
-          LDAI_OUTPUT="dist/$out" tools/linuxdeploy \
+          # Pass 1: populate the AppDir (binary, desktop entry, icon theme).
+          tools/linuxdeploy \
             --appdir AppDir \
             --executable target/release/fastestvpn-gui \
             --desktop-file fastestvpn-gui.desktop \
-            --icon-file assets/fastestvpn-gui.svg \
-            --output appimage
+            --icon-file assets/icons/256x256/fastestvpn-gui.png \
+            --icon-file assets/icons/512x512/fastestvpn-gui.png \
+            --icon-file assets/icons/128x128/fastestvpn-gui.png \
+            --icon-file assets/icons/64x64/fastestvpn-gui.png \
+            --icon-file assets/icons/48x48/fastestvpn-gui.png \
+            --icon-file assets/icons/32x32/fastestvpn-gui.png \
+            --icon-file assets/fastestvpn-gui.svg
+
+          # linuxdeploy picks the SVG for .DirIcon, but AppImage tooling and file-manager
+          # thumbnailers expect a PNG there.
+          rm -f AppDir/.DirIcon
+          cp assets/icons/256x256/fastestvpn-gui.png AppDir/.DirIcon
+          file AppDir/.DirIcon | grep -q PNG
+          find AppDir/usr/share/icons -type f | sort
+
+          # Pass 2: package the prepared AppDir.
+          LDAI_OUTPUT="dist/$out" tools/linuxdeploy --appdir AppDir --output appimage
 
           cd dist
           sha256sum "$out" > "$out.sha256"
@@ -84,7 +114,7 @@ jobs:
           if-no-files-found: error
 
   release:
-    if: github.ref_type == 'tag'
+    if: github.event_name == 'release' || github.ref_type == 'tag' || inputs.release_tag != ''
     needs: build
     runs-on: ubuntu-latest
     permissions:
@@ -96,6 +126,8 @@ jobs:
 
       - uses: softprops/action-gh-release@v2
         with:
+          # Empty for tag pushes / release events, where the ref already names the tag.
+          tag_name: ${{ inputs.release_tag }}
           files: |
             *.AppImage
             *.AppImage.sha256

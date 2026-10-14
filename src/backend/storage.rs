@@ -2,7 +2,7 @@ use crate::backend::config::{
     get_fastestvpn_presets, load_profile_from_file, VpnProfile, VpnProtocol,
 };
 use crate::backend::elevation::ElevationManager;
-use crate::backend::openvpn::load_ovpn_profile_from_file;
+use crate::backend::openvpn::{load_ovpn_profile_from_file, FASTESTVPN_PORT};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -124,6 +124,11 @@ impl ProfileStore {
         let presets = get_fastestvpn_presets(&settings.user_private_key, &settings.user_assigned_ip);
         for mut preset in presets {
             preset.protocol = settings.preferred_protocol;
+            if preset.protocol != VpnProtocol::WireGuard {
+                // Presets carry WireGuard endpoints; OpenVPN uses the same host on its own port.
+                let host = preset.config.peer.endpoint.split(':').next().unwrap_or_default();
+                preset.ovpn_endpoint = Some(format!("{host}:{FASTESTVPN_PORT}"));
+            }
             if !profiles.iter().any(|p| p.id == preset.id) {
                 profiles.push(preset);
             }

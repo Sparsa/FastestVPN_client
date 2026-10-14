@@ -21,13 +21,10 @@ impl LogsView {
     pub fn render(&mut self, ui: &mut egui::Ui, service: &VpnBackendService) {
         let logs = service.logs.lock().unwrap().clone();
 
-        ui.add_space(10.0);
-
         // Toolbar
         card_frame().show(ui, |ui| {
+            ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
-                ui.label(RichText::new("📜 Backend & Elevation Logs").strong().color(COLOR_TEXT).size(14.0));
-
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("Clear Logs").clicked() {
                         service.logs.lock().unwrap().clear();
@@ -70,7 +67,7 @@ impl LogsView {
                                 continue;
                             }
 
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 ui.label(
                                     RichText::new(format!("[{}]", entry.timestamp))
                                         .color(COLOR_TEXT_MUTED)

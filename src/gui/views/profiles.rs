@@ -8,16 +8,11 @@ use crate::gui::theme::{
 };
 use eframe::egui::{self, Button, Color32, RichText, ScrollArea, TextEdit, Vec2};
 
+/// Server list, protocol choice and profile import, shown in the side pane.
 pub struct ProfilesView {
     search_query: String,
     show_new_dialog: bool,
-    show_credentials_dialog: bool,
-
-    // Login state
-    login_username: String,
-    login_password: String,
-    show_password: bool,
-    login_msg: Option<Result<String, String>>,
+    import_error: Option<String>,
 
     // New profile form state
     new_name: String,
@@ -27,11 +22,6 @@ pub struct ProfilesView {
     new_public_key: String,
     new_endpoint: String,
     new_form_error: Option<String>,
-
-    // Quick credentials form state
-    cred_private_key: String,
-    cred_address: String,
-    cred_msg: Option<String>,
 }
 
 impl Default for ProfilesView {
@@ -39,11 +29,7 @@ impl Default for ProfilesView {
         Self {
             search_query: String::new(),
             show_new_dialog: false,
-            show_credentials_dialog: false,
-            login_username: String::new(),
-            login_password: String::new(),
-            show_password: false,
-            login_msg: None,
+            import_error: None,
             new_name: String::new(),
             new_private_key: String::new(),
             new_address: "10.13.1.2/32".to_string(),
@@ -51,19 +37,20 @@ impl Default for ProfilesView {
             new_public_key: String::new(),
             new_endpoint: String::new(),
             new_form_error: None,
-            cred_private_key: String::new(),
-            cred_address: "10.13.1.2/32".to_string(),
-            cred_msg: None,
         }
     }
 }
 
-impl ProfilesView {
-    /// Shows the outcome of an API login in the account dialog.
-    pub fn set_login_feedback(&mut self, result: Result<String, String>) {
-        self.login_msg = Some(result);
+pub fn protocol_badge(protocol: VpnProtocol) -> (&'static str, Color32) {
+    match protocol {
+        VpnProtocol::WireGuard => ("WireGuard", COLOR_ACCENT),
+        VpnProtocol::OpenVpnUdp => ("OpenVPN UDP", Color32::from_rgb(168, 85, 247)),
+        VpnProtocol::OpenVpnTcp => ("OpenVPN TCP", Color32::from_rgb(234, 179, 8)),
     }
+}
 
+impl ProfilesView {
+    /// Returns `true` when the user started a connection, so the pane can close.
     pub fn render(
         &mut self,
         ui: &mut egui::Ui,
@@ -72,106 +59,107 @@ impl ProfilesView {
         settings: &mut AppSettings,
         profiles: &mut Vec<VpnProfile>,
         selected_profile_id: &mut String,
-    ) {
+    ) -> bool {
         let current_state = service.current_state.lock().unwrap().clone();
+        let is_busy = matches!(
+            current_state,
+            TunnelState::Connected { .. } | TunnelState::Connecting { .. } | TunnelState::Disconnecting
+        );
+        let mut connect_requested = false;
 
-        // Action Toolbar
+        // Protocol used for the built-in servers
         card_frame().show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("🔍").size(15.0));
-                ui.add(
-                    TextEdit::singleline(&mut self.search_query)
-                        .hint_text("Search country, city, server...")
-                        .desired_width(200.0),
-                );
-
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button(RichText::new("➕ New Profile").strong()).clicked() {
-                        self.show_new_dialog = true;
-                        self.new_form_error = None;
-                    }
-
-                    if ui.button(RichText::new("📁 Import (.conf / .ovpn)").strong()).clicked() {
-                        if let Some(path) = rfd::FileDialog::new()
-                            .add_filter("VPN Profiles", &["conf", "ovpn"])
-                            .pick_file()
-                        {
-                            match store.import_file(&path) {
-                                Ok(imported) => {
-                                    *selected_profile_id = imported.id.clone();
-                                    *profiles = store.load_all_profiles(settings);
-                                }
-                                Err(err) => {
-                                    eprintln!("Import error: {err}");
-                                }
-                            }
-                        }
-                    }
-
-                    let cred_btn_label = if !settings.username.is_empty() {
-                        format!("👤 {}", settings.username)
-                    } else {
-                        "🔑 Account & Login".to_string()
-                    };
-
-                    if ui.button(RichText::new(cred_btn_label).color(COLOR_ACCENT).strong()).clicked() {
-                        self.login_username = settings.username.clone();
-                        self.login_password = settings.password.clone();
-                        self.cred_private_key = settings.user_private_key.clone();
-                        self.cred_address = settings.user_assigned_ip.clone();
-                        self.show_credentials_dialog = true;
-                        self.cred_msg = None;
+            ui.set_width(ui.available_width());
+            ui.label(RichText::new("Protocol").strong().color(COLOR_TEXT_MUTED).size(12.0));
+            ui.add_enabled_ui(!is_busy, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    for (proto, label) in [
+                        (VpnProtocol::WireGuard, "⚡ WireGuard"),
+                        (VpnProtocol::OpenVpnUdp, "🛡 OpenVPN UDP"),
+                        (VpnProtocol::OpenVpnTcp, "🔒 OpenVPN TCP"),
+                    ] {
+                        ui.selectable_value(&mut settings.preferred_protocol, proto, label);
                     }
                 });
             });
+            let hint = if settings.preferred_protocol != VpnProtocol::WireGuard && settings.username.trim().is_empty() {
+                RichText::new("⚠ OpenVPN needs your FastestVPN login (Account tab).").color(Color32::from_rgb(234, 179, 8))
+            } else {
+                RichText::new("Applies to built-in servers; imported profiles keep their own.").color(COLOR_TEXT_MUTED)
+            };
+            ui.label(hint.size(11.0));
         });
 
-        ui.add_space(10.0);
+        ui.add_space(8.0);
 
-        // Account Credentials & Login Dialog
-        if self.show_credentials_dialog {
-            self.render_credentials_dialog(ui, service, store, settings, profiles);
+        // Search + actions
+        ui.add(
+            TextEdit::singleline(&mut self.search_query)
+                .hint_text("🔍 Search country, city, server…")
+                .desired_width(f32::INFINITY),
+        );
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            if ui.button("📁 Import .conf / .ovpn").clicked() {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("VPN Profiles", &["conf", "ovpn"])
+                    .pick_file()
+                {
+                    match store.import_file(&path) {
+                        Ok(imported) => {
+                            *selected_profile_id = imported.id.clone();
+                            *profiles = store.load_all_profiles(settings);
+                            self.import_error = None;
+                        }
+                        Err(err) => self.import_error = Some(err),
+                    }
+                }
+            }
+            if ui.button("➕ New WireGuard Profile").clicked() {
+                self.show_new_dialog = !self.show_new_dialog;
+                self.new_form_error = None;
+            }
+        });
+
+        if let Some(ref err) = self.import_error {
+            ui.label(RichText::new(err).color(COLOR_ERROR).size(12.0));
         }
 
-        // New Profile Modal Dialog
+        ui.add_space(8.0);
+
         if self.show_new_dialog {
             self.render_new_profile_dialog(ui, store, settings, profiles, selected_profile_id);
         }
 
-        // Filter profiles
         let query = self.search_query.trim().to_lowercase();
-        let filtered_profiles: Vec<(usize, VpnProfile)> = profiles
+        let filtered_profiles: Vec<VpnProfile> = profiles
             .iter()
-            .enumerate()
-            .filter(|(_, p)| {
-                if query.is_empty() {
-                    return true;
-                }
-                p.name.to_lowercase().contains(&query)
+            .filter(|p| {
+                query.is_empty()
+                    || p.name.to_lowercase().contains(&query)
                     || p.country.to_lowercase().contains(&query)
                     || p.city.to_lowercase().contains(&query)
                     || p.country_code.to_lowercase().contains(&query)
                     || p.display_endpoint().to_lowercase().contains(&query)
             })
-            .map(|(i, p)| (i, p.clone()))
+            .cloned()
             .collect();
 
-        // Profiles List Scroll Area
         ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
             if filtered_profiles.is_empty() {
                 ui.add_space(30.0);
                 ui.vertical_centered(|ui| {
-                    ui.label(RichText::new("No VPN profiles found matching your search.").color(COLOR_TEXT_MUTED));
+                    ui.label(RichText::new("No servers match your search.").color(COLOR_TEXT_MUTED));
                 });
                 return;
             }
 
-            for (_, profile) in filtered_profiles {
+            for profile in filtered_profiles {
                 let is_selected = &profile.id == selected_profile_id;
-                let is_active_tunnel = match &current_state {
-                    TunnelState::Connected { profile_name, .. } => profile_name == &profile.name,
-                    _ => false,
-                };
+                let is_active_tunnel = matches!(
+                    &current_state,
+                    TunnelState::Connected { profile_name, .. } if profile_name == &profile.name
+                );
 
                 let stroke_color = if is_active_tunnel {
                     COLOR_CONNECTED
@@ -181,87 +169,67 @@ impl ProfilesView {
                     Color32::from_rgb(51, 65, 85)
                 };
 
-                egui::Frame::new()
-                    .fill(if is_selected { COLOR_SURFACE_LIGHT } else { Color32::from_rgb(24, 33, 47) })
-                    .corner_radius(egui::CornerRadius::same(8))
-                    .stroke(egui::Stroke::new(1.2, stroke_color))
-                    .inner_margin(egui::Margin::symmetric(14, 10))
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            // Country Badge
-                            let (badge_rect, _) = ui.allocate_exact_size(Vec2::new(34.0, 24.0), egui::Sense::hover());
-                            ui.painter().rect_filled(badge_rect, 4.0, Color32::from_rgb(15, 23, 42));
-                            ui.painter().text(
-                                badge_rect.center(),
-                                egui::Align2::CENTER_CENTER,
-                                &profile.country_code,
-                                egui::FontId::proportional(12.0),
-                                COLOR_ACCENT,
-                            );
-
-                            ui.add_space(6.0);
-
-                            // Server Details
-                            ui.vertical(|ui| {
-                                ui.horizontal(|ui| {
-                                    ui.label(RichText::new(&profile.name).strong().size(14.0).color(COLOR_TEXT));
-
-                                    // Protocol Badge
-                                    let (proto_label, proto_color) = match profile.protocol {
-                                        VpnProtocol::WireGuard => ("WireGuard", COLOR_ACCENT),
-                                        VpnProtocol::OpenVpnUdp => ("OpenVPN UDP", Color32::from_rgb(168, 85, 247)),
-                                        VpnProtocol::OpenVpnTcp => ("OpenVPN TCP", Color32::from_rgb(234, 179, 8)),
-                                    };
-
-                                    ui.label(
-                                        RichText::new(format!("[{proto_label}]"))
-                                            .size(11.0)
-                                            .color(proto_color)
-                                            .strong(),
-                                    );
-
-                                    if profile.is_preset {
-                                        ui.label(RichText::new("Preset").size(11.0).color(COLOR_TEXT_MUTED));
-                                    } else {
-                                        ui.label(RichText::new("Custom").size(11.0).color(COLOR_CONNECTED));
-                                    }
-                                });
-                                ui.label(
-                                    RichText::new(format!("{} • {}", profile.city, profile.display_endpoint()))
-                                        .size(11.5)
-                                        .color(COLOR_TEXT_MUTED),
+                // A sensing container registers before its children, so the buttons
+                // inside still take their own clicks; elsewhere the card selects.
+                let card = ui.scope_builder(egui::UiBuilder::new().sense(egui::Sense::click()), |ui| {
+                    egui::Frame::new()
+                        .fill(if is_selected { COLOR_SURFACE_LIGHT } else { Color32::from_rgb(24, 33, 47) })
+                        .corner_radius(egui::CornerRadius::same(8))
+                        .stroke(egui::Stroke::new(1.2, stroke_color))
+                        .inner_margin(egui::Margin::symmetric(10, 8))
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.horizontal(|ui| {
+                                // Country Badge
+                                let (badge_rect, _) = ui.allocate_exact_size(Vec2::new(30.0, 22.0), egui::Sense::hover());
+                                ui.painter().rect_filled(badge_rect, 4.0, Color32::from_rgb(15, 23, 42));
+                                ui.painter().text(
+                                    badge_rect.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    &profile.country_code,
+                                    egui::FontId::proportional(11.5),
+                                    COLOR_ACCENT,
                                 );
-                            });
 
-                            // Action Buttons
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if is_active_tunnel {
-                                    let btn = Button::new(RichText::new("Disconnect").size(12.0).strong().color(Color32::WHITE))
-                                        .fill(Color32::from_rgb(220, 38, 38));
-                                    if ui.add(btn).clicked() {
-                                        service.send_command(ServiceCommand::Disconnect);
-                                    }
-                                } else {
-                                    let btn = Button::new(RichText::new("Connect").size(12.0).strong().color(Color32::WHITE))
-                                        .fill(if is_selected { COLOR_ACCENT } else { Color32::from_rgb(51, 65, 85) });
-                                    if ui.add(btn).clicked() {
-                                        *selected_profile_id = profile.id.clone();
-                                        service.send_command(ServiceCommand::Connect {
-                                            profile: profile.clone(),
-                                            username: settings.username.clone(),
-                                            password: settings.password.clone(),
-                                        });
-                                    }
-                                }
+                                ui.vertical(|ui| {
+                                    ui.label(RichText::new(&profile.name).strong().size(13.5).color(COLOR_TEXT));
+                                    let (proto_label, proto_color) = protocol_badge(profile.protocol);
+                                    ui.horizontal(|ui| {
+                                        ui.label(RichText::new(proto_label).size(10.5).color(proto_color).strong());
+                                        ui.label(
+                                            RichText::new(if profile.is_preset { "Preset" } else { "Custom" })
+                                                .size(10.5)
+                                                .color(if profile.is_preset { COLOR_TEXT_MUTED } else { COLOR_CONNECTED }),
+                                        );
+                                    });
+                                    ui.label(RichText::new(profile.display_endpoint()).size(11.0).color(COLOR_TEXT_MUTED));
+                                });
 
-                                if !is_selected && !is_active_tunnel {
-                                    if ui.button(RichText::new("Select").size(12.0)).clicked() {
-                                        *selected_profile_id = profile.id.clone();
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    if is_active_tunnel {
+                                        let btn = Button::new(RichText::new("Disconnect").size(12.0).strong().color(Color32::WHITE))
+                                            .fill(Color32::from_rgb(220, 38, 38));
+                                        if ui.add(btn).clicked() {
+                                            service.send_command(ServiceCommand::Disconnect);
+                                        }
+                                    } else {
+                                        let btn = Button::new(RichText::new("Connect").size(12.0).strong().color(Color32::WHITE))
+                                            .fill(if is_selected { COLOR_ACCENT } else { Color32::from_rgb(51, 65, 85) });
+                                        if ui.add_enabled(!is_busy, btn).clicked() {
+                                            *selected_profile_id = profile.id.clone();
+                                            service.send_command(ServiceCommand::Connect {
+                                                profile: profile.clone(),
+                                                username: settings.username.clone(),
+                                                password: settings.password.clone(),
+                                            });
+                                            connect_requested = true;
+                                        }
                                     }
-                                }
 
-                                if !profile.is_preset && !is_active_tunnel {
-                                    if ui.button(RichText::new("🗑").size(12.0).color(COLOR_ERROR)).clicked() {
+                                    if !profile.is_preset
+                                        && !is_active_tunnel
+                                        && ui.button(RichText::new("🗑").size(12.0).color(COLOR_ERROR)).on_hover_text("Delete profile").clicked()
+                                    {
                                         let _ = store.delete_profile(&profile.id);
                                         *profiles = store.load_all_profiles(settings);
                                         if selected_profile_id == &profile.id {
@@ -270,163 +238,21 @@ impl ProfilesView {
                                             }
                                         }
                                     }
-                                }
+                                });
                             });
                         });
-                    });
+                });
 
-                ui.add_space(6.0);
+                if card.response.clicked() && !is_busy {
+                    *selected_profile_id = profile.id.clone();
+                }
+                card.response.on_hover_cursor(egui::CursorIcon::PointingHand);
+
+                ui.add_space(5.0);
             }
         });
-    }
 
-    fn render_credentials_dialog(
-        &mut self,
-        ui: &mut egui::Ui,
-        service: &VpnBackendService,
-        store: &ProfileStore,
-        settings: &mut AppSettings,
-        profiles: &mut Vec<VpnProfile>,
-    ) {
-        card_frame().show(ui, |ui| {
-            ui.vertical(|ui| {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("👤 FastestVPN Account & Credentials").strong().size(15.0).color(COLOR_TEXT));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("✖").clicked() {
-                            self.show_credentials_dialog = false;
-                        }
-                    });
-                });
-
-                ui.add_space(8.0);
-
-                // Section 1: Username & Password Authentication (for OpenVPN and API verification)
-                ui.group(|ui| {
-                    ui.label(RichText::new("1. FastestVPN Login (Username & Password)").strong().size(13.0).color(COLOR_ACCENT));
-                    ui.label(
-                        RichText::new("Used for OpenVPN tunnels and for verifying your active subscription status with FastestVPN API.")
-                            .size(11.5)
-                            .color(COLOR_TEXT_MUTED),
-                    );
-
-                    ui.add_space(6.0);
-
-                    ui.horizontal(|ui| {
-                        ui.label("Account Email:");
-                        ui.add(TextEdit::singleline(&mut self.login_username).hint_text("user@example.com").desired_width(260.0));
-                    });
-
-                    ui.horizontal(|ui| {
-                        ui.label("Account Password:");
-                        ui.add(
-                            TextEdit::singleline(&mut self.login_password)
-                                .password(!self.show_password)
-                                .hint_text("password")
-                                .desired_width(220.0),
-                        );
-                        ui.checkbox(&mut self.show_password, "Show");
-                    });
-
-                    ui.add_space(6.0);
-
-                    ui.horizontal(|ui| {
-                        if ui.button(RichText::new("🔐 Verify Account with FastestVPN API").strong()).clicked() {
-                            settings.username = self.login_username.trim().to_string();
-                            settings.password = self.login_password.trim().to_string();
-                            let _ = store.save_settings(settings);
-                            self.login_msg = Some(Ok("Verifying account…".to_string()));
-
-                            service.send_command(ServiceCommand::LoginApi {
-                                username: settings.username.clone(),
-                                password: settings.password.clone(),
-                            });
-                        }
-
-                        if !settings.username.is_empty() {
-                            if ui.button(RichText::new("Log Out / Clear").color(COLOR_ERROR)).clicked() {
-                                settings.username.clear();
-                                settings.password.clear();
-                                settings.auth_token = None;
-                                settings.account_status = None;
-                                settings.expiry_date = None;
-                                settings.plan_name = None;
-                                self.login_msg = None;
-                                self.login_username.clear();
-                                self.login_password.clear();
-                                let _ = store.save_settings(settings);
-                            }
-                        }
-                    });
-
-                    match &self.login_msg {
-                        Some(Err(err)) => {
-                            ui.add_space(4.0);
-                            ui.label(RichText::new(format!("✖ {err}")).color(COLOR_ERROR).size(12.0));
-                        }
-                        Some(Ok(msg)) => {
-                            ui.add_space(4.0);
-                            ui.label(RichText::new(msg).color(COLOR_TEXT_MUTED).size(12.0));
-                        }
-                        None => {}
-                    }
-
-                    if let Some(ref status) = settings.account_status {
-                        ui.add_space(4.0);
-                        let expiry = settings.expiry_date.as_deref().unwrap_or("Active");
-                        ui.label(
-                            RichText::new(format!("✓ Account Status: {status} • Expiry: {expiry}"))
-                                .color(COLOR_CONNECTED)
-                                .size(12.0),
-                        );
-                    }
-                });
-
-                ui.add_space(10.0);
-
-                // Section 2: WireGuard Cryptographic Keypair (for WireGuard Protocol)
-                ui.group(|ui| {
-                    ui.label(RichText::new("2. WireGuard Keypair (Optional, for WireGuard Protocol)").strong().size(13.0).color(COLOR_ACCENT));
-                    ui.label(
-                        RichText::new("If using the WireGuard protocol, enter your assigned 44-character PrivateKey and Client IP.")
-                            .size(11.5)
-                            .color(COLOR_TEXT_MUTED),
-                    );
-
-                    ui.add_space(6.0);
-
-                    ui.label("WireGuard PrivateKey (44 chars Base64):");
-                    ui.add(TextEdit::singleline(&mut self.cred_private_key).hint_text("e.g. YWFhYWFhY...=").desired_width(450.0));
-
-                    ui.add_space(4.0);
-                    ui.label("Assigned Client Address / IP:");
-                    ui.add(TextEdit::singleline(&mut self.cred_address).hint_text("e.g. 10.13.1.2/32").desired_width(250.0));
-                });
-
-                if let Some(ref msg) = self.cred_msg {
-                    ui.add_space(6.0);
-                    ui.label(RichText::new(msg).color(COLOR_CONNECTED).size(12.0));
-                }
-
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    if ui.button(RichText::new("Save All Credentials").strong().color(Color32::WHITE)).clicked() {
-                        settings.username = self.login_username.trim().to_string();
-                        settings.password = self.login_password.trim().to_string();
-                        settings.user_private_key = self.cred_private_key.trim().to_string();
-                        settings.user_assigned_ip = self.cred_address.trim().to_string();
-                        let _ = store.save_settings(settings);
-                        *profiles = store.load_all_profiles(settings);
-                        self.cred_msg = Some("All credentials saved successfully!".to_string());
-                    }
-
-                    if ui.button("Close").clicked() {
-                        self.show_credentials_dialog = false;
-                    }
-                });
-            });
-        });
-        ui.add_space(10.0);
+        connect_requested
     }
 
     fn render_new_profile_dialog(
@@ -437,105 +263,95 @@ impl ProfilesView {
         profiles: &mut Vec<VpnProfile>,
         selected_profile_id: &mut String,
     ) {
+        let field_width = ui.available_width() - 28.0;
         card_frame().show(ui, |ui| {
-            ui.vertical(|ui| {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("➕ Create WireGuard Profile").strong().size(15.0).color(COLOR_TEXT));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("✖").clicked() {
-                            self.show_new_dialog = false;
-                        }
-                    });
-                });
-
-                ui.add_space(6.0);
-
-                ui.horizontal(|ui| {
-                    ui.label("Profile Name:");
-                    ui.add(TextEdit::singleline(&mut self.new_name).hint_text("e.g. Germany Dedicated").desired_width(220.0));
-                });
-
-                ui.horizontal(|ui| {
-                    ui.label("Endpoint (host:port):");
-                    ui.add(TextEdit::singleline(&mut self.new_endpoint).hint_text("e.g. de-01.jumptoserver.com:51820").desired_width(260.0));
-                });
-
-                ui.horizontal(|ui| {
-                    ui.label("Server PublicKey:");
-                    ui.add(TextEdit::singleline(&mut self.new_public_key).hint_text("44-char base64 server key").desired_width(320.0));
-                });
-
-                ui.horizontal(|ui| {
-                    ui.label("Client PrivateKey:");
-                    ui.add(TextEdit::singleline(&mut self.new_private_key).hint_text("44-char base64 private key").desired_width(320.0));
-                });
-
-                ui.horizontal(|ui| {
-                    ui.label("Address:");
-                    ui.add(TextEdit::singleline(&mut self.new_address).hint_text("10.13.1.2/32").desired_width(160.0));
-                    ui.label("DNS:");
-                    ui.add(TextEdit::singleline(&mut self.new_dns).hint_text("1.1.1.1, 1.0.0.1").desired_width(160.0));
-                });
-
-                if let Some(ref err) = self.new_form_error {
-                    ui.label(RichText::new(format!("Error: {err}")).color(COLOR_ERROR).size(12.0));
-                }
-
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    if ui.button(RichText::new("Save Profile").strong().color(Color32::WHITE)).clicked() {
-                        let config = WireGuardConfig {
-                            interface: InterfaceConfig {
-                                private_key: self.new_private_key.trim().to_string(),
-                                address: self.new_address.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
-                                dns: self.new_dns.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
-                                mtu: Some(1420),
-                                listen_port: None,
-                                pre_up: Vec::new(),
-                                post_up: Vec::new(),
-                                pre_down: Vec::new(),
-                                post_down: Vec::new(),
-                            },
-                            peer: PeerConfig {
-                                public_key: self.new_public_key.trim().to_string(),
-                                preshared_key: None,
-                                endpoint: self.new_endpoint.trim().to_string(),
-                                allowed_ips: vec!["0.0.0.0/0".to_string(), "::/0".to_string()],
-                                persistent_keepalive: Some(25),
-                            },
-                        };
-
-                        match config.validate() {
-                            Ok(()) => {
-                                let profile = VpnProfile::new_custom(
-                                    if self.new_name.trim().is_empty() { "Custom FastestVPN".to_string() } else { self.new_name.trim().to_string() },
-                                    config,
-                                );
-                                match store.save_profile(&profile) {
-                                    Ok(_) => {
-                                        *selected_profile_id = profile.id.clone();
-                                        *profiles = store.load_all_profiles(settings);
-                                        self.show_new_dialog = false;
-                                        self.new_form_error = None;
-                                    }
-                                    Err(e) => {
-                                        self.new_form_error = Some(format!("Failed to save: {e}"));
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                self.new_form_error = Some(format!("{e}"));
-                            }
-                        }
-                    }
-
-                    if ui.button("Cancel").clicked() {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("➕ New WireGuard Profile").strong().size(14.0).color(COLOR_TEXT));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("✖").clicked() {
                         self.show_new_dialog = false;
-                        self.new_form_error = None;
                     }
                 });
             });
+
+            ui.add_space(6.0);
+            ui.label("Profile Name");
+            ui.add(TextEdit::singleline(&mut self.new_name).hint_text("e.g. Germany Dedicated").desired_width(field_width));
+            ui.label("Endpoint (host:port)");
+            ui.add(TextEdit::singleline(&mut self.new_endpoint).hint_text("de-01.jumptoserver.com:51820").desired_width(field_width));
+            ui.label("Server PublicKey");
+            ui.add(TextEdit::singleline(&mut self.new_public_key).hint_text("44-char base64 server key").desired_width(field_width));
+            ui.label("Client PrivateKey");
+            ui.add(
+                TextEdit::singleline(&mut self.new_private_key)
+                    .password(true)
+                    .hint_text("44-char base64 private key")
+                    .desired_width(field_width),
+            );
+            ui.label("Address");
+            ui.add(TextEdit::singleline(&mut self.new_address).hint_text("10.13.1.2/32").desired_width(field_width));
+            ui.label("DNS");
+            ui.add(TextEdit::singleline(&mut self.new_dns).hint_text("1.1.1.1, 1.0.0.1").desired_width(field_width));
+
+            if let Some(ref err) = self.new_form_error {
+                ui.label(RichText::new(format!("Error: {err}")).color(COLOR_ERROR).size(12.0));
+            }
+
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.button(RichText::new("Save Profile").strong().color(Color32::WHITE)).clicked() {
+                    let config = WireGuardConfig {
+                        interface: InterfaceConfig {
+                            private_key: self.new_private_key.trim().to_string(),
+                            address: self.new_address.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
+                            dns: self.new_dns.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
+                            mtu: Some(1420),
+                            listen_port: None,
+                            pre_up: Vec::new(),
+                            post_up: Vec::new(),
+                            pre_down: Vec::new(),
+                            post_down: Vec::new(),
+                        },
+                        peer: PeerConfig {
+                            public_key: self.new_public_key.trim().to_string(),
+                            preshared_key: None,
+                            endpoint: self.new_endpoint.trim().to_string(),
+                            allowed_ips: vec!["0.0.0.0/0".to_string(), "::/0".to_string()],
+                            persistent_keepalive: Some(25),
+                        },
+                    };
+
+                    match config.validate() {
+                        Ok(()) => {
+                            let profile = VpnProfile::new_custom(
+                                if self.new_name.trim().is_empty() { "Custom FastestVPN".to_string() } else { self.new_name.trim().to_string() },
+                                config,
+                            );
+                            match store.save_profile(&profile) {
+                                Ok(_) => {
+                                    *selected_profile_id = profile.id.clone();
+                                    *profiles = store.load_all_profiles(settings);
+                                    self.show_new_dialog = false;
+                                    self.new_form_error = None;
+                                }
+                                Err(e) => {
+                                    self.new_form_error = Some(format!("Failed to save: {e}"));
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            self.new_form_error = Some(format!("{e}"));
+                        }
+                    }
+                }
+
+                if ui.button("Cancel").clicked() {
+                    self.show_new_dialog = false;
+                    self.new_form_error = None;
+                }
+            });
         });
-        ui.add_space(10.0);
+        ui.add_space(8.0);
     }
 }

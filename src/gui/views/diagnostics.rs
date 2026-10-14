@@ -29,9 +29,8 @@ impl DiagnosticsView {
         let policy_path = Path::new("/usr/share/polkit-1/actions/com.fastestvpn.wgquick.policy");
         let policy_installed = policy_path.exists();
 
-        ui.add_space(10.0);
-
         card_frame().show(ui, |ui| {
+            ui.set_width(ui.available_width());
             ui.vertical(|ui| {
                 ui.label(RichText::new("🛠 System & VPN Diagnostics").strong().size(15.0).color(COLOR_TEXT));
                 ui.label(
@@ -104,12 +103,13 @@ impl DiagnosticsView {
 
         // Action tools card
         card_frame().show(ui, |ui| {
+            ui.set_width(ui.available_width());
             ui.vertical(|ui| {
                 ui.label(RichText::new("⚡ Quick Remediation & Maintenance").strong().size(14.0).color(COLOR_TEXT));
 
                 ui.add_space(10.0);
 
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     if ui.button(RichText::new("🔐 Install Polkit Policy").color(Color32::WHITE)).clicked() {
                         service.send_command(ServiceCommand::InstallPolkitPolicy);
                     }
@@ -139,11 +139,11 @@ impl DiagnosticsView {
 
             ui.add_space(6.0);
             ui.label(RichText::new(name).strong().color(COLOR_TEXT).size(13.0));
-
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(RichText::new(detail).color(COLOR_TEXT_MUTED).size(12.0));
-            });
         });
-        ui.add_space(4.0);
+        // Detail goes on its own wrapped line so it fits the narrow side pane.
+        ui.indent(name, |ui| {
+            ui.label(RichText::new(detail).color(COLOR_TEXT_MUTED).size(11.5));
+        });
+        ui.add_space(6.0);
     }
 }

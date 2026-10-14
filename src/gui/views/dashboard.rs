@@ -1,4 +1,5 @@
 use crate::backend::config::{VpnProfile, VpnProtocol};
+use crate::gui::views::profiles::protocol_badge;
 use crate::backend::service::{ServiceCommand, VpnBackendService};
 use crate::backend::storage::AppSettings;
 use crate::backend::tunnel::{NetworkStats, TunnelState};
@@ -11,14 +12,21 @@ use std::time::Instant;
 
 pub struct DashboardView;
 
+/// Requests from the dashboard that the app shell handles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DashboardAction {
+    OpenServers,
+}
+
 impl DashboardView {
     pub fn render(
         ui: &mut egui::Ui,
         service: &VpnBackendService,
-        settings: &mut AppSettings,
+        settings: &AppSettings,
         profiles: &[VpnProfile],
-        selected_profile_id: &mut String,
-    ) {
+        selected_profile_id: &str,
+    ) -> Option<DashboardAction> {
+        let mut action = None;
         let current_state = service.current_state.lock().unwrap().clone();
         let stats = service.latest_stats.lock().unwrap().clone();
 
@@ -36,45 +44,40 @@ impl DashboardView {
 
                 let is_busy = matches!(current_state, TunnelState::Connected { .. } | TunnelState::Connecting { .. });
 
-                // Server and Protocol Row
+                // Selected server summary; choosing happens in the side pane.
+                let selected = profiles.iter().find(|p| p.id == selected_profile_id);
+                let effective_protocol = selected
+                    .map(|p| if p.is_preset { settings.preferred_protocol } else { p.protocol })
+                    .unwrap_or(settings.preferred_protocol);
+
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("Server:").strong().color(COLOR_TEXT_MUTED));
-
-                    let current_name = profiles
-                        .iter()
-                        .find(|p| &p.id == selected_profile_id)
-                        .map(|p| format!("{} ({})", p.name, p.country_code))
-                        .unwrap_or_else(|| "Select a Server Profile".to_string());
-
-                    ui.add_enabled_ui(!is_busy, |ui| {
-                        egui::ComboBox::from_id_salt("profile_selector")
-                            .selected_text(RichText::new(current_name).color(COLOR_TEXT).strong())
-                            .width(280.0)
-                            .show_ui(ui, |ui| {
-                                for profile in profiles {
-                                    let label = format!("[{}] {} - {}", profile.country_code, profile.name, profile.display_endpoint());
-                                    ui.selectable_value(
-                                        selected_profile_id,
-                                        profile.id.clone(),
-                                        label,
-                                    );
+                    let summary_width = 360.0_f32.min(ui.available_width());
+                    ui.add_space(((ui.available_width() - summary_width) / 2.0).max(0.0));
+                    ui.vertical(|ui| {
+                        ui.set_width(summary_width);
+                        ui.horizontal(|ui| {
+                            match selected {
+                                Some(p) => {
+                                    ui.label(RichText::new(&p.country_code).strong().size(13.0).color(COLOR_ACCENT));
+                                    ui.label(RichText::new(&p.name).strong().size(16.0).color(COLOR_TEXT));
+                                }
+                                None => {
+                                    ui.label(RichText::new("No server selected").size(16.0).color(COLOR_TEXT_MUTED));
+                                }
+                            }
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if ui.add_enabled(!is_busy, Button::new("Change ›")).clicked() {
+                                    action = Some(DashboardAction::OpenServers);
                                 }
                             });
-                    });
-
-                    ui.add_space(10.0);
-
-                    // Protocol Selector Dropdown
-                    ui.label(RichText::new("Protocol:").strong().color(COLOR_TEXT_MUTED));
-                    ui.add_enabled_ui(!is_busy, |ui| {
-                        egui::ComboBox::from_id_salt("protocol_selector")
-                            .selected_text(RichText::new(format!("{}", settings.preferred_protocol)).strong().color(COLOR_ACCENT))
-                            .width(150.0)
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut settings.preferred_protocol, VpnProtocol::WireGuard, "⚡ WireGuard");
-                                ui.selectable_value(&mut settings.preferred_protocol, VpnProtocol::OpenVpnUdp, "🛡 OpenVPN (UDP)");
-                                ui.selectable_value(&mut settings.preferred_protocol, VpnProtocol::OpenVpnTcp, "🔒 OpenVPN (TCP)");
-                            });
+                        });
+                        let (proto_label, proto_color) = protocol_badge(effective_protocol);
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(proto_label).strong().size(12.0).color(proto_color));
+                            if let Some(p) = selected {
+                                ui.label(RichText::new(format!("• {}", p.display_endpoint())).size(12.0).color(COLOR_TEXT_MUTED));
+                            }
+                        });
                     });
                 });
 
@@ -108,7 +111,7 @@ impl DashboardView {
                 if btn_resp.clicked() {
                     if is_connected {
                         service.send_command(ServiceCommand::Disconnect);
-                    } else if let Some(selected) = profiles.iter().find(|p| &p.id == selected_profile_id) {
+                    } else if let Some(selected) = selected {
                         let mut target_profile = selected.clone();
                         // The protocol picker applies to built-in presets only; imported
                         // .conf/.ovpn profiles can only be run with their own protocol.
@@ -145,7 +148,7 @@ impl DashboardView {
                     TunnelState::Disconnected => {
                         if settings.preferred_protocol != VpnProtocol::WireGuard && settings.username.trim().is_empty() {
                             ui.label(
-                                RichText::new("⚠️ OpenVPN requires your FastestVPN Username & Password. Sign in on the Servers tab.")
+                                RichText::new("⚠️ OpenVPN requires your FastestVPN login. Open ☰ → Account to sign in.")
                                     .color(COLOR_CONNECTING)
                                     .size(12.5),
                             );
@@ -182,6 +185,8 @@ impl DashboardView {
 
         // Realtime Network Statistics Cards
         Self::render_stats_grid(ui, &stats, &current_state);
+
+        action
     }
 
     fn render_status_banner(ui: &mut egui::Ui, state: &TunnelState) {
@@ -216,14 +221,28 @@ impl DashboardView {
         });
     }
 
+    /// Draws the direction arrow directly; the bundled fonts lack the ↓/↑ glyphs.
+    fn paint_arrow(ui: &mut egui::Ui, down: bool, color: Color32) {
+        let (rect, _) = ui.allocate_exact_size(Vec2::new(24.0, 28.0), Sense::hover());
+        let c = rect.center();
+        let (tip, tail) = if down { (c.y + 9.0, c.y - 9.0) } else { (c.y - 9.0, c.y + 9.0) };
+        let stroke = egui::Stroke::new(2.5, color);
+        let painter = ui.painter();
+        painter.line_segment([egui::pos2(c.x, tail), egui::pos2(c.x, tip)], stroke);
+        let wing = if down { -7.0 } else { 7.0 };
+        painter.line_segment([egui::pos2(c.x - 6.0, tip + wing), egui::pos2(c.x, tip)], stroke);
+        painter.line_segment([egui::pos2(c.x + 6.0, tip + wing), egui::pos2(c.x, tip)], stroke);
+    }
+
     fn render_stats_grid(ui: &mut egui::Ui, stats: &NetworkStats, state: &TunnelState) {
         let is_connected = matches!(state, TunnelState::Connected { .. });
 
         ui.columns(2, |columns| {
             // Download Card
             card_frame().show(&mut columns[0], |ui| {
+                ui.set_width(ui.available_width());
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("↓").size(24.0).color(COLOR_ACCENT).strong());
+                    Self::paint_arrow(ui, true, COLOR_ACCENT);
                     ui.vertical(|ui| {
                         ui.label(RichText::new("DOWNLOAD SPEED").size(11.0).color(COLOR_TEXT_MUTED).strong());
                         let speed_str = if is_connected {
@@ -245,8 +264,9 @@ impl DashboardView {
 
             // Upload Card
             card_frame().show(&mut columns[1], |ui| {
+                ui.set_width(ui.available_width());
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("↑").size(24.0).color(COLOR_CONNECTED).strong());
+                    Self::paint_arrow(ui, false, COLOR_CONNECTED);
                     ui.vertical(|ui| {
                         ui.label(RichText::new("UPLOAD SPEED").size(11.0).color(COLOR_TEXT_MUTED).strong());
                         let speed_str = if is_connected {

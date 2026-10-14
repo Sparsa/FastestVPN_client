@@ -72,11 +72,21 @@ fn main() -> eframe::Result<()> {
     }
 
     // Launch GUI Desktop Application
+    let mut viewport = eframe::egui::ViewportBuilder::default()
+        // Wide enough for the dashboard plus the ~400px options pane.
+        .with_inner_size([1000.0, 640.0])
+        .with_min_inner_size([760.0, 520.0])
+        .with_title("FastestVPN Client")
+        .with_app_id("fastestvpn-gui");
+
+    // Window/taskbar icon, embedded so it also works outside an installed .desktop entry.
+    match eframe::icon_data::from_png_bytes(include_bytes!("../assets/icons/256x256/fastestvpn-gui.png")) {
+        Ok(icon) => viewport = viewport.with_icon(icon),
+        Err(e) => eprintln!("Failed to load window icon: {e}"),
+    }
+
     let native_options = eframe::NativeOptions {
-        viewport: eframe::egui::ViewportBuilder::default()
-            .with_inner_size([780.0, 580.0])
-            .with_min_inner_size([620.0, 460.0])
-            .with_title("FastestVPN Client - WireGuard"),
+        viewport,
         ..Default::default()
     };
 
